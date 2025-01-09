@@ -1,5 +1,6 @@
 __pycache__/
 config.py
 temp_files/
-*.log
+*log*
+app.log*
 *.session*
