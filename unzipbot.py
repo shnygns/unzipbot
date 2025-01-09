@@ -6,7 +6,7 @@ import tarfile
 import py7zr
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from config import BOT_TOKEN, API_ID, API_HASH
+from config import BOT_TOKEN, API_ID, API_HASH, ALLOWED_USERS
 from telegram import Update, InputFile, error
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 from telethon.sync import TelegramClient
@@ -51,6 +51,9 @@ last_reported_progress = 0
 MIN_PROGRESS_UPDATE_SIZE = 3 * 1024 * 1024  # 3 MB
 
 async def start(update: Update, context: CallbackContext) -> None:
+    requester_id = update.message.from_user.id
+    if requester_id not in ALLOWED_USERS:
+        return
     try:
         await update.message.reply_text("Send me a .zip, .rar, .7z, or .gz file, and I will extract its contents for you!")
     except Exception as e:
@@ -59,6 +62,11 @@ async def start(update: Update, context: CallbackContext) -> None:
 async def handle_file(update: Update, context: CallbackContext) -> None:
     """Handle file uploads."""
     # Get the file
+
+    requester_id = update.message.from_user.id
+    if requester_id not in ALLOWED_USERS:
+        return
+    
     global last_reported_progress
     file = update.message.document
     chat_id = update.message.chat_id
@@ -107,6 +115,51 @@ async def handle_file(update: Update, context: CallbackContext) -> None:
         extracted_dir = os.path.join(TEMP_DIR, os.path.splitext(file_name)[0])
         os.makedirs(extracted_dir, exist_ok=True)
 
+        password_attempts = 3
+        for attempt in range(password_attempts):
+            try:
+                if file_name.endswith('.zip'):
+                    # Attempt to extract ZIP file
+                    with zipfile.ZipFile(original_file_path) as archive:
+                        if archive.testzip():  # Check if password is required
+                            await update.message.reply_text("This archive is password-protected. Please provide the password:")
+                            password = await get_user_response(update, context)
+                            archive.setpassword(password.encode())
+                        archive.extractall(extracted_dir)
+                elif file_name.endswith('.rar'):
+                    # Attempt to extract RAR file
+                    with rarfile.RarFile(original_file_path) as archive:
+                        if archive.needs_password():
+                            await update.message.reply_text("This archive is password-protected. Please provide the password:")
+                            password = await get_user_response(update, context)
+                            archive.extractall(extracted_dir, pwd=password)
+                elif file_name.endswith('.7z'):
+                    # Attempt to extract 7Z file
+                    with py7zr.SevenZipFile(original_file_path, mode='r') as archive:
+                        await update.message.reply_text("This archive is password-protected. Please provide the password:")
+                        password = await get_user_response(update, context)
+                        archive.extractall(extracted_dir, password=password)
+                elif file_name.endswith('.gz'):
+                    # Handle GZ files (no password support)
+                    extract_gzip(original_file_path, extracted_dir)
+                else:
+                    await update.message.reply_text("Unsupported file format.")
+                    return
+                break  # Break the loop if extraction succeeds
+            except (zipfile.BadZipFile, rarfile.BadRarFile, py7zr.Bad7zFile, RuntimeError) as e:
+                logging.error(f"Password attempt {attempt + 1} failed: {e}")
+                if attempt < password_attempts - 1:
+                    await update.message.reply_text("Incorrect password. Please try again.")
+                else:
+                    await update.message.reply_text("Too many incorrect attempts. Extraction aborted.")
+                    cleanup(original_file_path, extracted_dir)
+                    return
+    except Exception as e:
+        await update.message.reply_text(f"Failed to extract the archive: {e}")
+        cleanup(original_file_path, extracted_dir)
+        return
+
+        """
         if file_name.endswith('.zip'):
             with zipfile.ZipFile(original_file_path, 'r') as archive:
                 archive.extractall(extracted_dir)
@@ -125,7 +178,7 @@ async def handle_file(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(f"Failed to extract the archive: {e}")
         cleanup(original_file_path, extracted_dir)
         return
-
+    """
     # Send extracted files
     for root, dirs, files in os.walk(extracted_dir):
         dirs[:] = [d for d in dirs if not d.startswith('.')]
@@ -200,6 +253,15 @@ def extract_gzip(file_path, output_dir):
         with tarfile.open(output_file, 'r') as tar:
             tar.extractall(output_dir)
         os.remove(output_file)  # Clean up the tarball
+
+
+async def get_user_response(update: Update, context: CallbackContext) -> str:
+    """Wait for the user to send a password."""
+    def check_response(reply_update):
+        return reply_update.message.chat_id == update.message.chat_id
+
+    response = await context.bot.wait_for("message", check=check_response, timeout=60)
+    return response.text
 
 
 def main():
