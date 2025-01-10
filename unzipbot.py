@@ -5,12 +5,12 @@ import gzip
 import tarfile
 import py7zr
 import logging
+import asyncio
 from logging.handlers import TimedRotatingFileHandler
 from config import BOT_TOKEN, API_ID, API_HASH, ALLOWED_USERS
-from telegram import Update, InputFile, error
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from telegram import Update, error, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, ConversationHandler
 from telethon.sync import TelegramClient
-from telethon.errors import ChannelPrivateError, BadRequestError, UserAdminInvalidError, TimedOutError, UserDeletedError, UsernameInvalidError
 
 # Path to store temporary files
 TEMP_DIR = "temp_files"
@@ -49,6 +49,7 @@ app = None
 telethon = None
 last_reported_progress = 0
 MIN_PROGRESS_UPDATE_SIZE = 3 * 1024 * 1024  # 3 MB
+WAITING_FOR_PASSWORD = 1
 
 async def start(update: Update, context: CallbackContext) -> None:
     requester_id = update.message.from_user.id
@@ -114,134 +115,199 @@ async def handle_file(update: Update, context: CallbackContext) -> None:
         # Extract the contents
         extracted_dir = os.path.join(TEMP_DIR, os.path.splitext(file_name)[0])
         os.makedirs(extracted_dir, exist_ok=True)
+        context.user_data["file_name"] = file_name
+        context.user_data['original_file_path'] = original_file_path
+        context.user_data['extracted_dir'] = extracted_dir
+  
 
-        password_attempts = 3
-        for attempt in range(password_attempts):
-            try:
-                if file_name.endswith('.zip'):
-                    # Attempt to extract ZIP file
-                    with zipfile.ZipFile(original_file_path) as archive:
-                        if archive.testzip():  # Check if password is required
-                            await update.message.reply_text("This archive is password-protected. Please provide the password:")
-                            password = await get_user_response(update, context)
-                            archive.setpassword(password.encode())
-                        archive.extractall(extracted_dir)
-                elif file_name.endswith('.rar'):
-                    # Attempt to extract RAR file
-                    with rarfile.RarFile(original_file_path) as archive:
-                        if archive.needs_password():
-                            await update.message.reply_text("This archive is password-protected. Please provide the password:")
-                            password = await get_user_response(update, context)
-                            archive.extractall(extracted_dir, pwd=password)
-                elif file_name.endswith('.7z'):
-                    # Attempt to extract 7Z file
-                    with py7zr.SevenZipFile(original_file_path, mode='r') as archive:
-                        await update.message.reply_text("This archive is password-protected. Please provide the password:")
-                        password = await get_user_response(update, context)
-                        archive.extractall(extracted_dir, password=password)
-                elif file_name.endswith('.gz'):
-                    # Handle GZ files (no password support)
-                    extract_gzip(original_file_path, extracted_dir)
-                else:
-                    await update.message.reply_text("Unsupported file format.")
-                    return
-                break  # Break the loop if extraction succeeds
-            except (zipfile.BadZipFile, rarfile.BadRarFile, py7zr.Bad7zFile, RuntimeError) as e:
-                logging.error(f"Password attempt {attempt + 1} failed: {e}")
-                if attempt < password_attempts - 1:
-                    await update.message.reply_text("Incorrect password. Please try again.")
-                else:
-                    await update.message.reply_text("Too many incorrect attempts. Extraction aborted.")
-                    cleanup(original_file_path, extracted_dir)
-                    return
-    except Exception as e:
-        await update.message.reply_text(f"Failed to extract the archive: {e}")
-        cleanup(original_file_path, extracted_dir)
-        return
-
-        """
         if file_name.endswith('.zip'):
-            with zipfile.ZipFile(original_file_path, 'r') as archive:
+            # Attempt to extract ZIP file
+            with zipfile.ZipFile(original_file_path) as archive:
+                try:
+                    archive.testzip()  # Check if password is required
+                except RuntimeError as e:
+                    if "password" in e.args[0].lower():
+                        context.user_data['password'] = None
+                        return await ask_for_password(update, context)
                 archive.extractall(extracted_dir)
         elif file_name.endswith('.rar'):
-            with rarfile.RarFile(original_file_path, 'r') as archive:
+            # Attempt to extract RAR file
+            with rarfile.RarFile(original_file_path) as archive:
+                if archive.needs_password():
+                    context.user_data['password'] = None
+                    return await ask_for_password(update, context)
                 archive.extractall(extracted_dir)
         elif file_name.endswith('.7z'):
+            # Attempt to extract 7Z file
             with py7zr.SevenZipFile(original_file_path, mode='r') as archive:
+                try:
+                    archive.list()  # Attempt to list the contents
+                except py7zr.exceptions.PasswordRequired:
+                    context.user_data['password'] = None
+                    return await ask_for_password(update, context)
                 archive.extractall(extracted_dir)
         elif file_name.endswith('.gz'):
-            extract_gzip(original_file_path, extracted_dir)
+            # Handle GZ files (no password support)
+            await extract_gzip(update, context, original_file_path, extracted_dir)
         else:
-            update.message.reply_text("Unsupported file format.")
+            await update.message.reply_text("Unsupported file format.")
             return
+        await send_extracted_files(update, context, extracted_dir)
     except Exception as e:
         await update.message.reply_text(f"Failed to extract the archive: {e}")
         cleanup(original_file_path, extracted_dir)
         return
-    """
+
+
     # Send extracted files
+async def send_extracted_files(update: Update, context: CallbackContext, extracted_dir: str) -> None:
+    retries = 3
+    file_number = 0
+    original_file_path = context.user_data['original_file_path']
     for root, dirs, files in os.walk(extracted_dir):
         dirs[:] = [d for d in dirs if not d.startswith('.')]
         for file in files:
+            file_number += 1
             file_path = os.path.join(root, file)
             if not os.path.isfile(file_path) or file.startswith('.') or os.path.getsize(file_path) == 0:  
                 continue
             if file.lower().endswith(('jpg', 'jpeg', 'png', 'gif')):
-                    try:
-                        with open(file_path, 'rb') as photo:
-                            await send_with_retry(update.message.reply_photo, photo=open(file_path, 'rb'))
-                    except Exception as e:
-                        logging.error(f"An error occurred while sending the photo: {e}")
-                        await update.message.reply_text("An error occurred while sending the photo.")
+                    for attempt in range(retries):
+                        try:
+                            with open(file_path, 'rb') as photo:
+                                await update.message.reply_photo(photo=photo)
+                                break
+                        except error.TimedOut as e:
+                            logging.warning(f"Timed out while sending message, retrying... (attempt {attempt + 1}/{retries})")
+                            await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the photo. (attempt {attempt + 1}/{retries})")
+                            if attempt == retries - 1:
+                                await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the photo. Attempting next file...")
+                                logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                continue
+                        except error.NetworkError as e:
+                            logging.warning(f"Network error while sending message, retrying... (attempt {attempt + 1}/{retries})")
+                            await update.message.reply_text(f"File {file_number}: A network error occurred while sending the photo. (attempt {attempt + 1}/{retries})")
+                            if attempt == retries - 1:
+                                logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                await update.message.reply_text(f"File {file_number}: A network error occurred while sending the photo. Attempting next file...")
+                                continue
+                        except Exception as e:
+                            logging.error(f"An error occurred while sending the photo: {e}")
+                            await update.message.reply_text(f"File {file_number}: An error occurred while sending the photo. (attempt {attempt + 1}/{retries})")
+                            if attempt == retries - 1:
+                                logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                await update.message.reply_text(f"File {file_number}: An error occurred while sending the photo. Attempting next file...")
+                                continue
             elif file.lower().endswith(('mp4', 'mov')):
-                    try:
-                        with open(file_path, 'rb') as video:
-                            await send_with_retry(update.message.reply_video, video=video)
-                    except Exception as e:
-                        logging.error(f"An error occurred while sending the video: {e}")
-                        await update.message.reply_text("An error occurred while sending the video.")
+                    for attempt in range(retries):
+                        try:
+                            with open(file_path, 'rb') as video:
+                                await update.message.reply_video(video=video, write_timeout = 180, read_timeout = 180)
+                                break
+                        except error.TimedOut as e:
+                            logging.warning(f"Timed out while sending message, retrying... (attempt {attempt + 1}/{retries})")
+                            await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. (attempt {attempt + 1}/{retries})")
+                            if attempt == retries - 2:
+                                await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting to send as file. (attempt {attempt + 1}/{retries})")
+                                logging.error(f"Failed to send message after {retries} attempts: {e} - Attempting to send as file.")
+                                try:
+                                    await context.bot.send_document(chat_id=update.message.chat_id, document=open(file_path, 'rb'))
+                                    break
+                                except error.TimedOut as e:
+                                    await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting next file...")
+                                    logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                    continue
+                        except error.NetworkError as e:
+                            logging.warning(f"Network error while sending message, retrying... (attempt {attempt + 1}/{retries})")
+                            await update.message.reply_text(f"File {file_number}: A network error occurred while sending the video. (attempt {attempt + 1}/{retries})")
+                            if attempt == retries - 2:
+                                await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting to send as file. (attempt {attempt + 1}/{retries})")
+                                logging.error(f"Failed to send message after {retries} attempts: {e} - Attempting to send as file.")
+                                try:
+                                    await context.bot.send_document(chat_id=update.message.chat_id, document=open(file_path, 'rb'))
+                                    break
+                                except error.TimedOut as e:
+                                    await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting next file...")
+                                    logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                    continue
+                        except Exception as e:
+                            logging.error(f"An error occurred while sending the video: {e}")
+                            await update.message.reply_text(f"File {file_number}: An error occurred while sending the video. (attempt {attempt + 1}/{retries})")
+                            if attempt == retries - 2:
+                                await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting to send as file. (attempt {attempt + 1}/{retries})")
+                                logging.error(f"Failed to send message after {retries} attempts: {e} - Attempting to send as file.")
+                                try:
+                                    await context.bot.send_document(chat_id=update.message.chat_id, document=open(file_path, 'rb'))
+                                    break
+                                except error.TimedOut as e:
+                                    await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting next file...")
+                                    logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                    continue
             else:
                 # Send as a regular file
-                try:
-                    with open(file_path, 'rb') as document:
-                        await send_with_retry(update.message.reply_document, document=document)
-                except Exception as e:
-                    logging.error(f"An error occurred while sending the document: {e}")
-                    await update.message.reply_text("An error occurred while sending the document.")
-
+                for attempt in range(retries):
+                    try:
+                        with open(file_path, 'rb') as document:
+                            await update.message.reply_document(document=document)
+                            break
+                    except error.TimedOut as e:
+                        logging.warning(f"Timed out while sending message, retrying... (attempt {attempt + 1}/{retries})")
+                        await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the file. (attempt {attempt + 1}/{retries})")
+                        if attempt == retries - 1:
+                            await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the file. Attempting next file...")
+                            logging.error(f"Failed to send message after {retries} attempts: {e}")
+                            continue
+                    except error.NetworkError as e:
+                        logging.warning(f"Network error while sending message, retrying... (attempt {attempt + 1}/{retries})")
+                        await update.message.reply_text(f"File {file_number}: A network error occurred while sending the file. (attempt {attempt + 1}/{retries})")
+                        if attempt == retries - 1:
+                            logging.error(f"Failed to send message after {retries} attempts: {e}")
+                            await update.message.reply_text(f"File {file_number}: A network error occurred while sending the file. Attempting next file...")
+                            continue
+                    except Exception as e:
+                        logging.error(f"An error occurred while sending the video: {e}")
+                        await update.message.reply_text(f"File {file_number}: An error occurred while sending the file. (attempt {attempt + 1}/{retries})")
+                        if attempt == retries - 1:
+                            logging.error(f"Failed to send message after {retries} attempts: {e}")
+                            await update.message.reply_text(f"File {file_number}: An error occurred while sending the file. Attempting next file...")
+                            continue
     # Cleanup
     cleanup(original_file_path, extracted_dir)
     await update.message.reply_text("Extraction complete!")
 
 
 def cleanup(original_file_path, extracted_dir):
-    os.remove(original_file_path)
+    if os.path.exists(original_file_path):
+        try:
+            os.remove(original_file_path)
+        except Exception as e:
+            pass
+
     for root, dirs, files in os.walk(extracted_dir, topdown=False):
         for name in files:
-            os.remove(os.path.join(root, name))
+            file_path = os.path.join(root, name)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    pass
+
         for name in dirs:
-            os.rmdir(os.path.join(root, name))
-    os.rmdir(extracted_dir)
+            dir_path = os.path.join(root, name)
+            if os.path.exists(dir_path):
+                try:
+                    os.rmdir(dir_path)
+                except Exception as e:
+                    pass
 
-
-async def send_with_retry(send_func, **kwargs):
-    """Send a message with retry mechanism."""
-    retries = 3
-    for attempt in range(retries):
+    if os.path.exists(extracted_dir):
         try:
-            await send_func(**kwargs)  # Increase timeout to 60 seconds
-            break
-        except error.TimedOut as e:
-            logging.warning(f"Timed out while sending message, retrying... (attempt {attempt + 1}/{retries})")
-            if attempt == retries - 1:
-                logging.error(f"Failed to send message after {retries} attempts: {e}")
-                raise
+            os.rmdir(extracted_dir)
         except Exception as e:
-            logging.error(f"An error occurred while sending message: {e}")
-            raise
+            pass
 
 
-def extract_gzip(file_path, output_dir):
+async def extract_gzip(update: Update, context: CallbackContext, file_path: str, output_dir: str) -> None:
     """Extract .gz files."""
     base_name = os.path.basename(file_path)
     output_file = os.path.join(output_dir, os.path.splitext(base_name)[0])  # Remove .gz extension
@@ -251,17 +317,78 @@ def extract_gzip(file_path, output_dir):
     # If the decompressed file is a tarball, extract it
     if tarfile.is_tarfile(output_file):
         with tarfile.open(output_file, 'r') as tar:
-            tar.extractall(output_dir)
+            try:
+                tar.extractall(output_dir)
+            except tarfile.ReadError as e:
+                if "password" in str(e).lower():
+                    await update.message.reply_text("This tarball is password-protected. Please provide the password:")
+                    context.user_data['password'] = None
+                    context.user_data['output_file'] = output_file
+                    context.user_data['output_dir'] = output_dir
+                    return await ask_for_password(update, context)
+
+        await send_extracted_files(update, context, output_dir)
         os.remove(output_file)  # Clean up the tarball
 
 
-async def get_user_response(update: Update, context: CallbackContext) -> str:
-    """Wait for the user to send a password."""
-    def check_response(reply_update):
-        return reply_update.message.chat_id == update.message.chat_id
+async def ask_for_password(update: Update, context: CallbackContext) -> int:
+    """Prompt the user for a password."""
+    await update.message.reply_text("This archive is password-protected. Please provide the password:")
+    return WAITING_FOR_PASSWORD
 
-    response = await context.bot.wait_for("message", check=check_response, timeout=60)
-    return response.text
+
+async def receive_password(update: Update, context: CallbackContext) -> int:
+    """Receive the password from the user."""
+    retries = 3
+    password = update.message.text
+    context.user_data['password'] = password
+    file_name = context.user_data['file_name']
+
+    original_file_path = context.user_data['original_file_path']
+    extracted_dir = context.user_data['extracted_dir']
+    for attempt in range(retries):
+        try:
+            if file_name.endswith('.zip'):
+                with zipfile.ZipFile(original_file_path) as archive:
+                    archive.setpassword(password.encode())
+                    archive.extractall(extracted_dir)
+            elif file_name.endswith('.rar'):
+                with rarfile.RarFile(original_file_path) as archive:
+                    archive.extractall(extracted_dir, pwd=password.encode())
+            elif file_name.endswith('.7z'):
+                with py7zr.SevenZipFile(original_file_path, mode='r') as archive:
+                    archive.extractall(extracted_dir, password=password)
+            elif file_name.endswith('.gz'):
+                output_file = context.user_data['output_file']
+                output_dir = context.user_data['output_dir']
+                with tarfile.open(output_file, 'r:gz', pwd=password.encode()) as tar:
+                    tar.extractall(output_dir)
+            await update.message.reply_text("Archive extracted successfully. Sending files...")
+            await send_extracted_files(update, context, extracted_dir)
+            return ConversationHandler.END
+        except RuntimeError as e:
+            if "Bad password" in str(e):
+                await update.message.reply_text("Incorrect password. Please try again.")
+                if attempt == retries - 1:
+                    await update.message.reply_text("Too many incorrect attempts. Operation cancelled.")
+                    return ConversationHandler.END
+                return WAITING_FOR_PASSWORD
+            else:
+                await update.message.reply_text(f"Failed to extract archive: {e}")
+                return ConversationHandler.END   
+        finally:
+            cleanup(original_file_path, extracted_dir) 
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: CallbackContext) -> int:
+    """Cancel the conversation."""
+    await update.message.reply_text("Operation cancelled.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+async def handle_file_loop(update: Update, context: CallbackContext) -> None:
+    return asyncio.create_task(handle_file(update, context))
+
 
 
 def main():
@@ -274,7 +401,17 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.ATTACHMENT, handle_file))
+    # app.add_handler(MessageHandler(filters.ATTACHMENT, handle_file))
+
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.ATTACHMENT, handle_file_loop)],
+        states={
+            WAITING_FOR_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_password)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
+    app.add_handler(conv_handler)
 
     try:
         if not API_ID and API_HASH:
