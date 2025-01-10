@@ -164,6 +164,7 @@ async def send_extracted_files(update: Update, context: CallbackContext, extract
     retries = 3
     file_number = 0
     original_file_path = context.user_data['original_file_path']
+    from_user = update.message.from_user
     for root, dirs, files in os.walk(extracted_dir):
         dirs[:] = [d for d in dirs if not d.startswith('.')]
         for file in files:
@@ -202,53 +203,35 @@ async def send_extracted_files(update: Update, context: CallbackContext, extract
                     for attempt in range(retries):
                         try:
                             with open(file_path, 'rb') as video:
-                                await update.message.reply_video(video=video, write_timeout = 180, read_timeout = 180)
+                                await telethon.send_file(from_user.id, video)
                                 break
                         except error.TimedOut as e:
                             logging.warning(f"Timed out while sending message, retrying... (attempt {attempt + 1}/{retries})")
                             await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. (attempt {attempt + 1}/{retries})")
-                            if attempt == retries - 2:
-                                await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting to send as file. (attempt {attempt + 1}/{retries})")
-                                logging.error(f"Failed to send message after {retries} attempts: {e} - Attempting to send as file.")
-                                try:
-                                    await context.bot.send_document(chat_id=update.message.chat_id, document=open(file_path, 'rb'))
-                                    break
-                                except error.TimedOut as e:
-                                    await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting next file...")
-                                    logging.error(f"Failed to send message after {retries} attempts: {e}")
-                                    continue
+                            if attempt == retries - 1:
+                                await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting next file...")
+                                logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                continue
                         except error.NetworkError as e:
                             logging.warning(f"Network error while sending message, retrying... (attempt {attempt + 1}/{retries})")
                             await update.message.reply_text(f"File {file_number}: A network error occurred while sending the video. (attempt {attempt + 1}/{retries})")
-                            if attempt == retries - 2:
-                                await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting to send as file. (attempt {attempt + 1}/{retries})")
-                                logging.error(f"Failed to send message after {retries} attempts: {e} - Attempting to send as file.")
-                                try:
-                                    await context.bot.send_document(chat_id=update.message.chat_id, document=open(file_path, 'rb'))
-                                    break
-                                except error.TimedOut as e:
-                                    await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting next file...")
-                                    logging.error(f"Failed to send message after {retries} attempts: {e}")
-                                    continue
+                            if attempt == retries - 1:
+                                logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                await update.message.reply_text(f"File {file_number}: A network error occurred while sending the video. Attempting next file...")
+                                continue
                         except Exception as e:
                             logging.error(f"An error occurred while sending the video: {e}")
                             await update.message.reply_text(f"File {file_number}: An error occurred while sending the video. (attempt {attempt + 1}/{retries})")
-                            if attempt == retries - 2:
-                                await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting to send as file. (attempt {attempt + 1}/{retries})")
-                                logging.error(f"Failed to send message after {retries} attempts: {e} - Attempting to send as file.")
-                                try:
-                                    await context.bot.send_document(chat_id=update.message.chat_id, document=open(file_path, 'rb'))
-                                    break
-                                except error.TimedOut as e:
-                                    await update.message.reply_text(f"File {file_number}: A timeout error occurred while sending the video. Attempting next file...")
-                                    logging.error(f"Failed to send message after {retries} attempts: {e}")
-                                    continue
+                            if attempt == retries - 1:
+                                logging.error(f"Failed to send message after {retries} attempts: {e}")
+                                await update.message.reply_text(f"File {file_number}: An error occurred while sending the video. Attempting next file...")
+                                continue
             else:
                 # Send as a regular file
                 for attempt in range(retries):
                     try:
                         with open(file_path, 'rb') as document:
-                            await update.message.reply_document(document=document)
+                            await telethon.send_file(from_user.id, document)
                             break
                     except error.TimedOut as e:
                         logging.warning(f"Timed out while sending message, retrying... (attempt {attempt + 1}/{retries})")
